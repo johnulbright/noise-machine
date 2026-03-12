@@ -1,0 +1,25 @@
+[Unit]
+Description=Brown noise playback
+After=sound.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=pi
+Group=audio
+ExecStartPre=/bin/sleep 3
+ExecStart=/usr/bin/mpv \
+    --no-video \
+    --loop-file=inf \
+    --audio-device=alsa \
+    --cache=yes \
+    --demuxer-max-bytes=100MiB \
+    --demuxer-readahead-secs=300 \
+    --really-quiet \
+    /opt/noise-machine/brown-noise.wav
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
