@@ -6,18 +6,20 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-User=pi
-Group=audio
-ExecStartPre=/bin/sleep 3
+User=root
+ExecStartPre=/bin/sh -c 'amixer -c 0 set PCM mute 2>/dev/null || true'
+ExecStartPre=/bin/sleep 2
 ExecStart=/usr/bin/mpv \
     --no-video \
     --loop-file=inf \
-    --audio-device=alsa \
+    --audio-device=alsa/hw:0,0 \
     --cache=yes \
     --demuxer-max-bytes=100MiB \
     --demuxer-readahead-secs=300 \
     --really-quiet \
     /opt/noise-machine/brown-noise.wav
+ExecStartPost=/bin/sleep 1
+ExecStartPost=/bin/sh -c 'amixer -c 0 set PCM unmute 2>/dev/null || true'
 Restart=on-failure
 RestartSec=5
 

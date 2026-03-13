@@ -65,10 +65,13 @@ if ! grep -q "^dtparam=audio=on" "$CONFIG_FILE" 2>/dev/null; then
     echo "dtparam=audio=on" >> "$CONFIG_FILE"
 fi
 
+# Force audio to 3.5mm jack
+raspi-config nonint do_audio 1 2>/dev/null || true
+
 # Set ALSA volume to max -- the PAM8403's onboard potentiometer handles volume
-amixer set 'Headphone' 100% unmute 2>/dev/null || \
-amixer set 'PCM' 100% unmute 2>/dev/null || \
-echo "  Could not set volume automatically. Check: amixer scontrols"
+amixer -c 0 set 'PCM' 100% unmute 2>/dev/null || \
+amixer -c 0 set 'Headphone' 100% unmute 2>/dev/null || \
+echo "  Could not set volume automatically. Check: amixer -c 0 scontrols"
 alsactl store 2>/dev/null || true
 
 # 5. Install systemd service

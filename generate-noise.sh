@@ -3,7 +3,7 @@
 # Run on macOS. Requires: brew install sox
 set -euo pipefail
 
-DURATION=50        # seconds (target 300 + 10 for crossfade)
+DURATION=310        # seconds (target 300 + 10 for crossfade)
 CROSSFADE=10        # seconds of overlap for seamless loop
 RATE=44100
 BITS=16
@@ -17,8 +17,9 @@ command -v sox >/dev/null 2>&1 || { echo "Error: sox not found. Install it: brew
 
 echo "Generating ${DURATION}s of brown noise..."
 sox -n -r "$RATE" -b "$BITS" -c "$CHANNELS" "$TMPDIR/raw.wav" \
-    synth "$DURATION" brownnoise vol 0.5 \
-    highpass 20 \
+    synth "$DURATION" brownnoise vol 0.2 \
+    highpass 10 \
+    bass +10 60 \
     compand 0.02,0.5 -90,-90,-60,-50,-30,-25,-10,-8,0,-3 -3 \
     norm -1
 
