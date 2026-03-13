@@ -14,12 +14,12 @@ echo "=== Noise Machine Setup ==="
 echo ""
 
 # 1. Install packages
-echo "[1/6] Installing packages..."
+echo "[1/7] Installing packages..."
 apt-get update -qq
 apt-get install -y -qq mpv alsa-utils
 
 # 2. Create application directory and copy audio file
-echo "[2/6] Setting up /opt/noise-machine/..."
+echo "[2/7] Setting up /opt/noise-machine/..."
 mkdir -p /opt/noise-machine
 
 if [ -f "$SCRIPT_DIR/../brown-noise.wav" ]; then
@@ -36,7 +36,7 @@ fi
 chown -R pi:audio /opt/noise-machine
 
 # 3. Configure ALSA for 3.5mm headphone output
-echo "[3/6] Configuring ALSA..."
+echo "[3/7] Configuring ALSA..."
 CARD_NAME=$(aplay -l 2>/dev/null | grep -oi 'Headphones\|bcm2835 Headphones\|Headphone' | head -1 || true)
 if [ -z "$CARD_NAME" ]; then
     CARD_NAME=$(aplay -l 2>/dev/null | grep "^card" | head -1 | sed 's/card [0-9]*: \([^]]*\)\[.*/\1/' | xargs || echo "Headphones")
@@ -57,7 +57,7 @@ EOF
 echo "  ALSA card: ${CARD_NAME}"
 
 # 4. Enable audio in boot config
-echo "[4/6] Enabling audio output..."
+echo "[4/7] Enabling audio output..."
 CONFIG_FILE="/boot/config.txt"
 [ -f "/boot/firmware/config.txt" ] && CONFIG_FILE="/boot/firmware/config.txt"
 
@@ -75,13 +75,27 @@ echo "  Could not set volume automatically. Check: amixer -c 0 scontrols"
 alsactl store 2>/dev/null || true
 
 # 5. Install systemd service
-echo "[5/6] Installing systemd service..."
+echo "[5/7] Installing systemd service..."
 cp "$SCRIPT_DIR/noise-machine.service" /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable noise-machine.service
 
-# 6. Disable swap (unnecessary for this appliance, reduces SD wear)
-echo "[6/6] Disabling swap..."
+# 6. Disable unnecessary services for faster boot
+echo "[6/7] Optimizing boot time..."
+systemctl disable bluetooth 2>/dev/null || true
+systemctl disable NetworkManager-wait-online.service 2>/dev/null || true
+systemctl disable ModemManager.service 2>/dev/null || true
+systemctl disable cloud-init-main.service 2>/dev/null || true
+systemctl disable cloud-init-local.service 2>/dev/null || true
+systemctl disable cloud-final.service 2>/dev/null || true
+systemctl disable cloud-config.service 2>/dev/null || true
+systemctl disable apt-daily.timer 2>/dev/null || true
+systemctl disable apt-daily-upgrade.timer 2>/dev/null || true
+systemctl disable man-db.timer 2>/dev/null || true
+systemctl disable e2scrub_all.timer 2>/dev/null || true
+
+# 7. Disable swap (unnecessary for this appliance, reduces SD wear)
+echo "[7/7] Disabling swap..."
 dphys-swapfile swapoff 2>/dev/null || true
 systemctl disable dphys-swapfile 2>/dev/null || true
 
