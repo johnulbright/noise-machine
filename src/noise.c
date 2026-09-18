@@ -23,15 +23,27 @@
  *   cannot random-walk the way a bare accumulator can, so the output is bounded
  *   for an unbounded run time by construction rather than by a safety clamp.
  *
- * - ALSA's stop_threshold is pushed to the ring boundary so a late refill does
- *   not kill the stream. The hardware keeps reading the ring and replays the
- *   last period. For *noise* specifically, replayed noise is indistinguishable
- *   from fresh noise, so a missed deadline is inaudible rather than a dropout.
- *   Lateness is still detected and counted, so it shows up in the journal.
+ * - stop_threshold is pushed to the ring boundary, which on a conventional
+ *   DMA-ring driver would keep a late refill from killing the stream. Be aware
+ *   that IT DOES NOT DO THAT ON THE PI, and do not rely on it:
+ *   bcm2835-audio is a snd_pcm_indirect driver. Its .pointer callback returns
+ *   snd_pcm_indirect_playback_pointer(), the bytes the DAC actually drains live
+ *   in VideoCore firmware rather than in the ALSA ring, and
+ *   bcm2835_playback_fifo() calls snd_pcm_stop(substream,
+ *   SNDRV_PCM_STATE_XRUN) on its own authority without ever consulting
+ *   runtime->stop_threshold (verified against the rpi kernel source). So on
+ *   this hardware an underrun is a real stop with a real gap. The setting is
+ *   kept because it is correct and free on any other device this might run on.
  *
- * - The stream is opened once and never stopped. Starting and stopping the Pi's
- *   PWM output swings a DC step through the amp's coupling cap, which a 24 dB
- *   amplifier turns into a thump; never stopping is the only real fix.
+ *   Two things follow. Underruns come back from writei as -EPIPE and are
+ *   counted as xruns, which is the honest signal. And because the stream truly
+ *   restarts, the fade-in is re-armed on every recovery -- resuming at full
+ *   amplitude would step the amp's coupling capacitor, which is exactly the
+ *   thump this design is trying to avoid.
+ *
+ * - Nothing here stops the stream deliberately. Starting and stopping the Pi's
+ *   PWM output swings a DC step through that capacitor, which 24 dB of gain
+ *   turns into an audible thump.
  */
 
 #define _GNU_SOURCE
@@ -39,6 +51,7 @@
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>   /* offsetof, used by the sd_notify socket address */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -63,7 +76,29 @@
 
 /* ------------------------------------------------------------------ config */
 
-#define SLOPE_SECTIONS 24 /* shelf sections in the fractional-slope filter */
+/*
+ * Shelf sections in the fractional-slope filter.
+ *
+ * More is NOT better here, which is worth stating because it is the opposite of
+ * the intuition. Measured deviation from an ideal line over 50 Hz - 10 kHz,
+ * computed from the cascade's own transfer function after self-calibration:
+ *
+ *        slope     K=8     K=12    K=16    K=24
+ *       -1.5     0.177   0.165   0.162   0.159
+ *       -3.0     0.236   0.251   0.263   0.278
+ *       -6.0     0.127   0.241   0.317   0.407
+ *       -7.5     0.147   0.184   0.291   0.427
+ *
+ * Packing more poles in crowds them toward Nyquist, where the bilinear
+ * transform's frequency warping is worst, and that costs more straightness than
+ * the tighter spacing buys. Cost scales the other way: K=24 was 2.3x the CPU of
+ * K=8, and on a Pi 3 the generator is a serial IIR chain that runs about 8.5 %
+ * of one core at K=24.
+ *
+ * 12 rather than 8: near-identical ripple, most of the saving, and it keeps a
+ * sane sections-per-octave density if slope_lo_hz/slope_hi_hz are ever widened.
+ */
+#define SLOPE_SECTIONS 12
 
 typedef struct {
     unsigned rate;
@@ -79,6 +114,7 @@ typedef struct {
     char device[128];
     unsigned period_frames;
     unsigned periods;
+    unsigned stats_sec;   /* how often to log late/recovered/clipped counts */
     uint64_t seed;
 } Config;
 
@@ -97,6 +133,7 @@ static void config_defaults(Config *c)
     c->independent  = true;
     c->period_frames = 8192;
     c->periods       = 4;
+    c->stats_sec     = 3600;
     c->seed          = 0; /* 0 = seed from the clock */
     snprintf(c->device, sizeof c->device, "hw:CARD=Headphones,DEV=0");
 }
@@ -338,6 +375,33 @@ static double calibrate_gain(const Config *c)
     double rms = sqrt(sum / (double)meas);
     if (!(rms > 0.0)) return 1.0;
 
+    /*
+     * Predict whether this level will clip, and say so.
+     *
+     * Brown noise is Gaussian-ish, so its peak is unbounded and grows with run
+     * length: the expected maximum of N samples is about sigma*sqrt(2*ln N).
+     * Over eight hours at 48 kHz that is 1.38e9 samples per channel, or about
+     * 16.2 dB above RMS -- considerably more than a short render shows, which is
+     * exactly how a level that measures clean for a minute clips all night.
+     *
+     * The previous build clipped roughly 450 samples a second and nothing ever
+     * mentioned it. Predicting it here is cheap; the alternative is a soft
+     * limiter, which would add distortion to a signal kept deliberately clean
+     * and, worse, would hide the problem instead of reporting it.
+     */
+    double n_night   = (double)c->rate * 8.0 * 3600.0;
+    double crest_est = 20.0 * log10(sqrt(2.0 * log(n_night)));
+    double peak_est  = c->level_dbfs + crest_est;
+
+    if (peak_est > -0.5) {
+        fprintf(stderr,
+            "noise: WARNING level_dbfs=%.1f will clip. Brown noise reaches about\n"
+            "noise:   %.1f dB above RMS over an 8-hour run, which puts the peak at\n"
+            "noise:   %+.1f dBFS. Use %.0f or lower, and raise the amplifier's pot\n"
+            "noise:   instead -- or the ALSA mixer, which has +4 dB of range.\n",
+            c->level_dbfs, crest_est, peak_est, floor(-0.5 - crest_est));
+    }
+
     return pow(10.0, c->level_dbfs / 20.0) / rms;
 }
 
@@ -377,6 +441,12 @@ static void player_init(Player *p, const Config *c, double gain, double fade_sec
     p->fade        = fade_sec > 0.0 ? 0.0 : 1.0;
     p->fade_step   = fade_sec > 0.0 ? 1.0 / (fade_sec * (double)c->rate) : 1.0;
 }
+
+/* Restart the fade-in. Called after any xrun recovery or device reopen: the
+ * stream genuinely stops on this hardware, and resuming at full amplitude puts
+ * a step through the amplifier's coupling capacitor. */
+__attribute__((unused))
+static void player_rearm_fade(Player *p) { p->fade = 0.0; }
 
 static inline void player_frame(Player *p, double *l, double *r)
 {
@@ -473,9 +543,19 @@ static void notify_init(void)
     if (notify_fd < 0) return;
     memset(&notify_addr, 0, sizeof notify_addr);
     notify_addr.sun_family = AF_UNIX;
-    strncpy(notify_addr.sun_path, p, sizeof notify_addr.sun_path - 1);
+
+    /* Clamp to what actually fits, and derive the address length from the
+     * copied string rather than the original -- otherwise an over-long
+     * NOTIFY_SOCKET would hand the kernel a length past the end of the struct. */
+    size_t n = strlen(p);
+    if (n > sizeof notify_addr.sun_path - 1) n = sizeof notify_addr.sun_path - 1;
+    memcpy(notify_addr.sun_path, p, n);
+
+    /* systemd usually hands out an abstract socket, spelled with a leading '@'
+     * that has to become a NUL byte in sun_path. The name then starts at
+     * sun_path[1] and the length must still count that leading NUL. */
     if (notify_addr.sun_path[0] == '@') notify_addr.sun_path[0] = '\0';
-    notify_len = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + strlen(p));
+    notify_len = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + n);
 }
 
 static void notify(const char *msg)
@@ -665,15 +745,22 @@ static int run_alsa(const Config *c, double gain)
             policy == SCHED_FIFO ? "SCHED_FIFO" :
             policy == SCHED_RR   ? "SCHED_RR" : "SCHED_OTHER (no realtime priority)");
 
-    int16_t *buf = calloc(period * c->channels, sizeof *buf);
+    /* cap tracks what buf is actually sized for. A reopen can hand back a
+     * different period than the first open did, and writing the new period into
+     * a buffer sized for the old one would be a heap overflow. */
+    snd_pcm_uframes_t cap = period;
+    int16_t *buf = calloc(cap * c->channels, sizeof *buf);
     Player *p = calloc(1, sizeof *p);
     if (!buf || !p) { fprintf(stderr, "noise: out of memory\n"); return 1; }
     /* 250 ms fade so the first buffer does not step the amp's coupling cap. */
     player_init(p, c, gain, 0.25);
 
-    unsigned long late = 0, recovered = 0;
+    unsigned long late = 0, xruns = 0;
+    snd_pcm_sframes_t low_water = (snd_pcm_sframes_t)buffer;
     unsigned long long frames_out = 0;
-    unsigned long long next_report = (unsigned long long)c->rate * 3600ull;
+    unsigned long long report_every = (unsigned long long)c->rate *
+                                      (c->stats_sec ? c->stats_sec : 3600u);
+    unsigned long long next_report = report_every;
     bool ready = false;
 
     notify_init();
@@ -681,9 +768,28 @@ static int run_alsa(const Config *c, double gain)
     for (;;) {
         player_fill_s16(p, buf, (unsigned)period);
 
-        /* A full ring plus one period pending means we missed a deadline. */
+        /*
+         * Measure how much audio is still queued ahead of the hardware, and
+         * track the worst case between reports.
+         *
+         * The obvious test -- avail > buffer_size, meaning the hardware pointer
+         * overtook ours -- is unreachable on this hardware. bcm2835-audio is a
+         * snd_pcm_indirect driver (.pointer returns
+         * snd_pcm_indirect_playback_pointer(), and the audio the DAC drains
+         * lives in VideoCore firmware, not in the ALSA ring), so the reported
+         * hw_ptr is bounded by appl_ptr and avail saturates at buffer_size.
+         * That test could only ever have printed zero.
+         *
+         * Queue depth works on any driver. Dropping below one period means we
+         * came within a refill of running dry, which is the early warning;
+         * actual xruns are counted separately as they come back from writei.
+         */
         snd_pcm_sframes_t avail = snd_pcm_avail(pcm);
-        if (avail > (snd_pcm_sframes_t)buffer) late++;
+        if (avail >= 0 && ready) {
+            snd_pcm_sframes_t queued = (snd_pcm_sframes_t)buffer - avail;
+            if (queued < (snd_pcm_sframes_t)period) late++;
+            if (queued < low_water) low_water = queued;
+        }
 
         snd_pcm_uframes_t left = period;
         int16_t *w = buf;
@@ -696,9 +802,19 @@ static int run_alsa(const Config *c, double gain)
                     fprintf(stderr, "noise: unrecoverable: %s; reopening\n", snd_strerror((int)n));
                     snd_pcm_close(pcm);
                     while (alsa_open(c, &pcm, &period, &buffer) != 0) sleep(1);
-                    break;
+                    player_rearm_fade(p);
+                    if (period > cap) {
+                        int16_t *nb = realloc(buf, period * c->channels * sizeof *buf);
+                        if (!nb) { fprintf(stderr, "noise: out of memory on reopen\n"); return 1; }
+                        buf = nb; cap = period;
+                    }
+                    break; /* w is now stale; the outer loop re-derives it */
                 }
-                recovered++;
+                /* bcm2835 forces SNDRV_PCM_STATE_XRUN from its own completion
+                 * path, so -EPIPE here is a real stop, not a near miss. The
+                 * stream restarts from silence; fade it back in. */
+                xruns++;
+                player_rearm_fade(p);
                 continue;
             }
             left -= (snd_pcm_uframes_t)n;
@@ -714,10 +830,14 @@ static int run_alsa(const Config *c, double gain)
         notify("WATCHDOG=1");
 
         if (frames_out >= next_report) {
-            fprintf(stderr, "noise: %llu h uptime, late %lu, recovered %lu, clipped %lu\n",
-                    frames_out / ((unsigned long long)c->rate * 3600ull),
-                    late, recovered, p->clipped);
-            next_report += (unsigned long long)c->rate * 3600ull;
+            fprintf(stderr,
+                    "noise: up %llus, xruns %lu, near-miss %lu, clipped %lu, "
+                    "min queue %ld/%lu frames\n",
+                    frames_out / (unsigned long long)c->rate,
+                    xruns, late, p->clipped,
+                    (long)low_water, (unsigned long)buffer);
+            low_water = (snd_pcm_sframes_t)buffer;
+            next_report += report_every;
         }
     }
 }
@@ -753,6 +873,7 @@ static int parse_kv(Config *c, const char *k, const char *v)
     else if (!strcmp(k, "independent"))   c->independent = atoi(v) != 0;
     else if (!strcmp(k, "period_frames")) c->period_frames = (unsigned)strtoul(v, NULL, 10);
     else if (!strcmp(k, "periods"))       c->periods = (unsigned)strtoul(v, NULL, 10);
+    else if (!strcmp(k, "stats_sec"))     c->stats_sec = (unsigned)strtoul(v, NULL, 10);
     else if (!strcmp(k, "seed"))          c->seed = strtoull(v, NULL, 10);
     else if (!strcmp(k, "device"))        snprintf(c->device, sizeof c->device, "%s", v);
     else return -1;
@@ -839,10 +960,11 @@ int main(int argc, char **argv)
     if (print_only) {
         printf("rate=%u\nchannels=%u\nslope_db_oct=%g\nslope_lo_hz=%g\nslope_hi_hz=%g\n"
                "highpass_hz=%g\nlowpass_hz=%g\nlevel_dbfs=%g\ndither=%d\nindependent=%d\n"
-               "device=%s\nperiod_frames=%u\nperiods=%u\nseed=%llu\n",
+               "device=%s\nperiod_frames=%u\nperiods=%u\nstats_sec=%u\nseed=%llu\n",
                c.rate, c.channels, c.slope_db_oct, c.slope_lo_hz, c.slope_hi_hz,
                c.highpass_hz, c.lowpass_hz, c.level_dbfs, c.dither, c.independent,
-               c.device, c.period_frames, c.periods, (unsigned long long)c.seed);
+               c.device, c.period_frames, c.periods, c.stats_sec,
+               (unsigned long long)c.seed);
         return 0;
     }
 

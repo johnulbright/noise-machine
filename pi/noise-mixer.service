@@ -23,7 +23,13 @@ RemainAfterExit=yes
 #
 # CARD_NAME is substituted by pi/setup.sh from the card this machine actually
 # has. Check it with: aplay -l
-ExecStart=/usr/bin/amixer -c CARD_NAME sset PCM 0dB unmute
+#
+# Two lines, deliberately: setting the level is the part that must not fail
+# silently, so it has no '-' prefix. Not every control has a mute switch (many
+# I2S DAC boards have no mixer at all), so the unmute is prefixed with '-' and
+# a failure there is tolerated.
+ExecStart=/usr/bin/amixer -c CARD_NAME sset PCM 0dB
+ExecStart=-/usr/bin/amixer -c CARD_NAME sset PCM unmute
 
 [Install]
 WantedBy=multi-user.target

@@ -81,18 +81,87 @@ Pi's analog output stage as hiss or whine.
 
 ## Setup
 
-### 1. Copy the repo to the Pi
+### 1. Copy the source to the Pi
 
 ```bash
-scp -r . pi@<pi-address>:~/noise-machine
+ssh pi@<pi-address> 'mkdir -p ~/noise-machine'
+scp -r Makefile noise.conf README.md src test ./pi pi@<pi-address>:~/noise-machine/
 ```
 
-There is no audio file to generate or transfer. Everything is source.
+There is no audio file to generate or transfer. Everything is source. (Copying
+the whole directory instead would drag along `.git` and the host's own compiled
+binaries, so the explicit list is deliberate.)
 
-### 2. Run setup
+### 2. Build and test, before changing anything
 
 ```bash
 ssh pi@<pi-address>
+sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+cd ~/noise-machine && make && make test
+```
+
+Worth doing separately rather than letting `setup.sh` do it, for two reasons.
+A compile failure surfaces while the system is still untouched. And `make test`
+re-validates the DSP on **aarch64** — the filter coefficients come out of
+`exp`, `log` and `tan`, and a different libm can shift them in the last bits.
+The tolerances absorb that, but it is worth confirming rather than assuming.
+
+Then check the ALSA backend actually linked in:
+
+```bash
+./bin/noise --device __no_such_device__
+```
+
+You want `noise: device not ready (attempt 1), retrying`. If you see
+`built without the ALSA backend` instead, `pkg-config` did not find alsa.
+Ctrl-C either way.
+
+### 3. Hear it once, in the foreground
+
+Before involving systemd, confirm the audio path works on its own. This
+separates two questions that are painful to debug together — *does ALSA work*
+and *does the service work*. If this plays, the rest is plumbing.
+
+**With headphones only** is the best first test: no amp, no wiring, nothing but
+the jack. The Pi's 3.5 mm output drives headphones directly; the amplifier
+exists to reach a passive speaker, not because the jack needs help.
+
+```bash
+amixer -c Headphones -- sset PCM -25dB   # start quiet, they are on your head
+./bin/noise --config noise.conf
+```
+
+From a second SSH session, bring it up while it plays:
+
+```bash
+amixer -c Headphones -- sset PCM -15dB
+amixer -c Headphones -- sset PCM -5dB
+amixer -c Headphones sset PCM 0dB        # the intended operating point
+```
+
+The `--` matters: `amixer` parses with getopt, so a negative dB value is read as
+a bundle of option flags without it (`invalid option -- '2'`). `0dB` has no
+leading hyphen, so it needs no `--`.
+
+Do not go above `0dB`. The control's ceiling is +4 dB, and that gain is what
+clipped the previous build.
+
+It should run without `sudo` — the default Pi user is in the `audio` group. It
+prints the device it opened, the rate, and the period and buffer it actually
+negotiated, then plays. Ctrl-C to stop.
+
+Two things to expect. It will log `SCHED_OTHER (no realtime priority)`, which is
+correct: realtime scheduling comes from the systemd unit you are not using yet.
+And headphones expose the PWM noise floor far more than a small speaker does —
+hiss underneath the brown noise is the hardware, and is what a DAC HAT removes.
+
+**With the amp connected**, same command; turn its pot up slowly instead. Leave
+the amp disconnected until you have speakers wired to it — powering that board
+with no speakers attached damages it.
+
+### 4. Run setup
+
+```bash
 sudo bash ~/noise-machine/pi/setup.sh
 ```
 
@@ -102,7 +171,39 @@ installs two systemd units, quiets the periodic timers that can stall audio,
 starts playback, and then verifies it. It is idempotent — re-run it after
 editing the source.
 
+It also renames any existing `/etc/asound.conf` or `/root/.asoundrc` to
+`.replaced-by-noise-machine`, because a user `~/.asoundrc` takes precedence over
+`/etc/asound.conf` and either can silently redirect audio to the wrong card.
+
+### 5. Read the verification block
+
+Setup ends by printing what it actually achieved. What you want:
+
+```
+service         : active
+pcm state       : RUNNING
+mixer           : 0.00dB
+scheduler       : SCHED_FIFO
+buffer          : period 8192  buffer 32768 (683 ms)
+power           : throttled=0x0 temp=38.1'C
+```
+
+- `pcm state` anything but `RUNNING` — the service is up but not feeding the
+  device.
+- `scheduler` reading `SCHED_OTHER` — the unit's realtime settings are not
+  applying. It will still work, with much less tolerance for jitter.
+- `power` anything but `throttled=0x0` — see **Power** above, and fix that
+  before judging how it sounds.
+
+If the service did not start, setup dumps the last 30 journal lines for you.
+
 Audio starts immediately and on every boot thereafter.
+
+To back it all out:
+
+```bash
+sudo systemctl disable --now noise-machine noise-mixer
+```
 
 ## Usage
 
@@ -205,8 +306,48 @@ the 10-minute run, which is what a genuinely zero-mean bounded process does. A
 drifting integrator would go the other way.
 
 ```bash
-./bin/noise --f32 --seconds 28800 --out - | ./bin/analyze - --band 200 8000
+make soak       # the 8-hour run above
+make check      # a 10-minute render, measured
 ```
+
+### The regression suite
+
+```bash
+make test       # ~1 minute, 52 assertions
+```
+
+Every assertion is a property the appliance depends on, and most correspond to a
+defect the previous build actually shipped: the spectrum really is −6 dB/oct,
+nothing clips, DC stays buried, the level is steady in the audible band, the
+channels are decorrelated, each tone control has the effect it claims, the same
+seed gives byte-identical output, and the 16-bit path measures like the float
+one. It also runs `setup.sh`'s card-detection pipeline against the verbatim
+`aplay -l` output from the target Pi, and checks that an HDMI-only machine
+yields nothing so setup fails loudly rather than configuring a silent device.
+
+It needs only a C compiler. No Pi, no ALSA, no sox, no Python.
+
+### A note on how loud you can go
+
+`level_dbfs` has a hard ceiling of **−17**, and the program warns at startup if
+you exceed it.
+
+Do not trust a short render here. Brown noise is Gaussian-ish, so its peak is
+unbounded and grows with run length — the expected maximum of N samples is about
+σ·√(2·ln N), which over eight hours at 48 kHz is **16.2 dB above RMS**. So:
+
+| `level_dbfs` | 5-minute render | 8-hour reality |
+|---|---|---|
+| −12 | 402 clipped, peak +1.1 dBFS | clips immediately |
+| −16 | 0 clipped, peak −2.9 dBFS | **predicted peak +0.2 dBFS — clips overnight** |
+| −17 | 0 clipped | ceiling, no warning |
+| −18 (default) | 0 clipped | measured peak −2.59 dBFS over 8 h |
+
+That `−16` row is the trap, and it is why the warning is computed from the
+predicted overnight peak rather than from what a test render happens to show.
+
+If it isn't loud enough, turn up the amp's pot first, then the ALSA mixer (which
+has +4 dB of range above 0 dB). Both are better than raising this.
 
 ## How it works
 
@@ -222,14 +363,32 @@ Three design choices carry most of the weight:
   startup, which is why `slope_db_oct` lands within ~0.02 dB/oct of target
   anywhere from 0 to -7.5. Because nothing integrates, the output is bounded
   for any run length by construction rather than by a safety clamp.
-- **ALSA's `stop_threshold` is pushed to the ring boundary.** A missed deadline
-  replays the previous period instead of killing the stream — and replayed
-  noise is indistinguishable from fresh noise, so lateness is inaudible rather
-  than a dropout. It is still counted and logged.
+- **A 683 ms ALSA buffer, taken at the device's maximum.** Latency is
+  irrelevant for noise, so buffer depth is free robustness against jitter.
 
-The stream is opened once and never stopped, because starting and stopping the
-Pi's PWM output swings a DC step through the amp's coupling capacitor that
-24 dB of gain turns into a thump.
+The stream is opened once and never deliberately stopped, because starting and
+stopping the Pi's PWM output swings a DC step through the amp's coupling
+capacitor that 24 dB of gain turns into a thump. When an underrun *does* force
+a restart, the 250 ms fade-in is re-armed rather than resuming at full
+amplitude.
+
+> **A design assumption that turned out to be wrong, recorded so it isn't
+> re-introduced.** `stop_threshold` is set to the ring boundary, which on a
+> conventional DMA-ring driver makes a late refill harmless — the hardware keeps
+> cycling the ring and replays stale samples, which for noise is inaudible. That
+> is not what happens here. `bcm2835-audio` is a `snd_pcm_indirect` driver: its
+> `.pointer` callback returns `snd_pcm_indirect_playback_pointer()`, the bytes
+> the DAC actually drains live in VideoCore firmware rather than in the ALSA
+> ring, and `bcm2835_playback_fifo()` calls
+> `snd_pcm_stop(substream, SNDRV_PCM_STATE_XRUN)` on its own authority without
+> ever consulting `runtime->stop_threshold` (verified against the Raspberry Pi
+> kernel source). On this hardware an underrun is a real stop with a real gap.
+>
+> The setting is kept because it is correct and free on any other device this
+> might run on, but nothing here relies on it. The same analysis killed the
+> original lateness detector: `avail > buffer_size` requires the hardware
+> pointer to overtake ours, which an indirect driver's bounded `hw_ptr` makes
+> impossible, so it could only ever have reported zero.
 
 ### Why it was rebuilt
 
@@ -301,6 +460,47 @@ cat /proc/asound/card0/pcm0p/sub0/status  # state: should be RUNNING
 
 The mixer control on a Pi 3 is `PCM`, not `Headphone` or `Master`. Set it to
 `0dB` rather than `100%` — 100% is +4 dB and will clip.
+
+**Reading the health line:**
+
+Every `stats_sec` (3600 by default) the service logs:
+
+```
+noise: up 3600s, xruns 0, near-miss 0, clipped 0, min queue 24576/32768 frames
+```
+
+- **`xruns`** — real dropouts. `bcm2835` forces `SNDRV_PCM_STATE_XRUN` itself,
+  so these come back from `snd_pcm_writei` as `-EPIPE`. Each one is an audible
+  gap plus a fade-in. This is the number that matters; it should be 0.
+- **`near-miss`** — times the queue fell below one period (8192 frames) without
+  actually running dry. An early warning: rising near-misses mean you are
+  heading for xruns.
+- **`min queue`** — the low-water mark since the last report, out of 32768.
+  Steady state should sit near 24576 (the buffer less one period). A number
+  trending toward 0 is the same warning with more resolution.
+
+**Confirming the counters actually count (worth doing once):**
+
+Prove the instrumentation works before trusting a quiet log, in about a minute:
+
+```bash
+sudo systemctl stop noise-machine
+# run it by hand, reporting every 10 s instead of hourly, with no realtime
+# priority so it is easy to starve
+sudo -u noise /usr/local/bin/noise --config /etc/noise-machine.conf --stats_sec 10
+```
+
+In another shell, starve it:
+
+```bash
+for i in 1 2 3 4 5 6 7 8; do (while :; do :; done) & done
+sleep 30; kill %1 %2 %3 %4 %5 %6 %7 %8
+```
+
+You should see `min queue` collapse toward 0 and `near-miss` climb while the
+load is on, and probably some `xruns` too. If all three stay at their idle
+values through obvious audible disturbance, the instrumentation is lying and
+should not be trusted. `Ctrl-C`, then `sudo systemctl start noise-machine`.
 
 **Clicks or dropouts:**
 

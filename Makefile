@@ -1,5 +1,9 @@
 CC      ?= cc
-CFLAGS  ?= -O2 -std=c11 -Wall -Wextra -Wno-unused-parameter
+# gnu11 rather than c11: alsa-lib's snd_pcm_hw_params_alloca() macros expand to
+# alloca(), whose declaration is only reliably visible with GNU extensions
+# enabled. The source already defines _GNU_SOURCE, so this just makes the
+# language mode agree with that instead of gambling on a transitive include.
+CFLAGS  ?= -O2 -std=gnu11 -Wall -Wextra -Wno-unused-parameter
 NOISELIBS =
 
 UNAME_S := $(shell uname -s)
@@ -9,7 +13,13 @@ ifeq ($(UNAME_S),Linux)
     CFLAGS    += -DHAVE_ALSA
     NOISELIBS += $(shell pkg-config --libs alsa)
   else
-    $(warning libasound2-dev not found: building without the ALSA backend)
+    # A hard error, not a warning. Without the backend this still builds, still
+    # renders files, still passes every test in the suite (they only exercise
+    # the render path) -- and never plays a sound. That is precisely the kind of
+    # silent success this project exists to stop shipping.
+    ifeq ($(filter clean,$(MAKECMDGOALS)),)
+      $(error libasound2-dev not found: pkg-config cannot see module 'alsa'. Run: sudo apt-get install -y libasound2-dev pkg-config)
+    endif
   endif
 endif
 ifeq ($(UNAME_S),Darwin)
@@ -30,12 +40,20 @@ bin/analyze: src/analyze.c | bin
 bin:
 	mkdir -p bin
 
-# Render and measure on a development machine. No Pi, no ALSA.
+# Regression suite: asserts the properties the appliance depends on. Needs only
+# a C compiler -- no Pi, no ALSA, no sox, no Python.
+test: bin/noise bin/analyze
+	@bash test/run-tests.sh
+
+# Render and measure by eye.
 check: bin/noise bin/analyze
-	./bin/noise --f32 --seconds 600 --seed 1 --out $(or $(TMPDIR),/tmp)/noise-check.f32
-	./bin/analyze $(or $(TMPDIR),/tmp)/noise-check.f32
+	./bin/noise --f32 --seconds 600 --seed 1 --out - | ./bin/analyze - --band 200 8000
+
+# Prove no drift over a full night. ~90 s of CPU, streamed, no disk.
+soak: bin/noise bin/analyze
+	./bin/noise --f32 --seconds 28800 --seed 11 --out - | ./bin/analyze - --band 200 8000
 
 clean:
 	rm -rf bin
 
-.PHONY: all check clean
+.PHONY: all test check soak clean

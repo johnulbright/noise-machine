@@ -313,18 +313,20 @@ static int open_src(const char *path, unsigned rate_hint, Src *s)
 int main(int argc, char **argv)
 {
     static const char *use =
-        "usage: analyze FILE [--rate N] [--band LO HI] [--window SEC] [--level-hp HZ]\n";
+        "usage: analyze FILE [--rate N] [--band LO HI] [--window SEC] [--level-hp HZ] [--kv]\n";
     const char *path = NULL;
     unsigned rate_hint = 48000;
     double flo = 50.0, fhi = 8000.0;
     double wsec = 0.5;
     double level_hp = 150.0; /* what a small driver actually radiates */
+    bool kv = false;          /* key=value output, for the test suite */
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--rate") && i + 1 < argc)          rate_hint = (unsigned)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--band") && i + 2 < argc)    { flo = atof(argv[++i]); fhi = atof(argv[++i]); }
         else if (!strcmp(argv[i], "--window") && i + 1 < argc)    wsec = atof(argv[++i]);
         else if (!strcmp(argv[i], "--level-hp") && i + 1 < argc)  level_hp = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--kv"))                        kv = true;
         else if (argv[i][0] != '-' || !argv[i][1])                path = argv[i]; /* "-" = stdin */
         else { fputs(use, stderr); return 2; }
     }
@@ -371,11 +373,16 @@ int main(int argc, char **argv)
 
     if (c[0].n == 0) { fprintf(stderr, "analyze: no samples\n"); return 1; }
 
-    printf("file            %s (%s, %u Hz, %u ch)\n",
-           path, s.f32 ? "float32" : "s16 wav", s.rate, s.channels);
-    printf("duration        %.2f s (%llu frames)\n",
-           (double)c[0].n / (double)s.rate, (unsigned long long)c[0].n);
-    printf("fft             %d-pt Hann, 50%% overlap, %lu segments\n\n", NFFT, c[0].segments);
+    if (kv) {
+        printf("rate=%u\nchannels=%u\ndur=%.3f\n",
+               s.rate, s.channels, (double)c[0].n / (double)s.rate);
+    } else {
+        printf("file            %s (%s, %u Hz, %u ch)\n",
+               path, s.f32 ? "float32" : "s16 wav", s.rate, s.channels);
+        printf("duration        %.2f s (%llu frames)\n",
+               (double)c[0].n / (double)s.rate, (unsigned long long)c[0].n);
+        printf("fft             %d-pt Hann, 50%% overlap, %lu segments\n\n", NFFT, c[0].segments);
+    }
 
     for (int ch = 0; ch < CH; ch++) {
         double rms  = sqrt(c[ch].sumsq / (double)c[ch].n);
@@ -387,25 +394,37 @@ int main(int argc, char **argv)
         level_stats(&lev[ch],   &sd,    &pp);
         level_stats(&levhp[ch], &sd_hp, &pp_hp);
 
-        printf("channel %d\n", ch);
-        printf("  rms           %+7.2f dBFS\n", db(rms));
-        printf("  true peak     %+7.2f dBFS\n", db(c[ch].peak));
-        printf("  crest factor  %7.2f dB\n", db(c[ch].peak) - db(rms));
-        printf("  clipped       %7lu samples%s\n", c[ch].clipped,
-               c[ch].clipped ? "   <-- FAIL" : "");
-        printf("  dc offset     %+7.2f dBFS\n", db(fabs(dc)));
-        printf("  slope         %+7.3f dB/oct  (%.0f-%.0f Hz, %d bands)\n", slope, flo, fhi, nb);
-        printf("  straightness  %7.3f dB     worst deviation from the fitted line\n", ripple);
-        printf("  steadiness    %7.3f dB sd  %.3f dB p-p   >%.0f Hz, %.1fs windows\n",
-               sd_hp, pp_hp, level_hp, wsec);
-        printf("  (broadband)   %7.3f dB sd  %.3f dB p-p   includes inaudible LF wander\n\n",
-               sd, pp);
+        if (kv) {
+            printf("ch%d.rms=%.3f\nch%d.peak=%.3f\nch%d.crest=%.3f\nch%d.clipped=%lu\n"
+                   "ch%d.dc=%.2f\nch%d.slope=%.4f\nch%d.straightness=%.4f\n"
+                   "ch%d.steady_sd=%.4f\nch%d.steady_pp=%.4f\nch%d.bb_sd=%.4f\n",
+                   ch, db(rms), ch, db(c[ch].peak), ch, db(c[ch].peak) - db(rms),
+                   ch, c[ch].clipped, ch, db(fabs(dc)), ch, slope, ch, ripple,
+                   ch, sd_hp, ch, pp_hp, ch, sd);
+        } else {
+            printf("channel %d\n", ch);
+            printf("  rms           %+7.2f dBFS\n", db(rms));
+            printf("  true peak     %+7.2f dBFS\n", db(c[ch].peak));
+            printf("  crest factor  %7.2f dB\n", db(c[ch].peak) - db(rms));
+            printf("  clipped       %7lu samples%s\n", c[ch].clipped,
+                   c[ch].clipped ? "   <-- FAIL" : "");
+            printf("  dc offset     %+7.2f dBFS\n", db(fabs(dc)));
+            printf("  slope         %+7.3f dB/oct  (%.0f-%.0f Hz, %d bands)\n", slope, flo, fhi, nb);
+            printf("  straightness  %7.3f dB     worst deviation from the fitted line\n", ripple);
+            printf("  steadiness    %7.3f dB sd  %.3f dB p-p   >%.0f Hz, %.1fs windows\n",
+                   sd_hp, pp_hp, level_hp, wsec);
+            printf("  (broadband)   %7.3f dB sd  %.3f dB p-p   includes inaudible LF wander\n\n",
+                   sd, pp);
+        }
     }
 
     double r = cross / (double)c[0].n /
                (sqrt(c[0].sumsq / (double)c[0].n) * sqrt(c[1].sumsq / (double)c[1].n));
-    printf("L/R correlation %+.4f  (%s)\n", r,
-           fabs(r) < 0.05 ? "independent" : fabs(r) > 0.95 ? "mono/identical" : "partially correlated");
+    if (kv)
+        printf("corr=%.4f\n", r);
+    else
+        printf("L/R correlation %+.4f  (%s)\n", r,
+               fabs(r) < 0.05 ? "independent" : fabs(r) > 0.95 ? "mono/identical" : "partially correlated");
 
     free(c);
     for (int ch = 0; ch < CH; ch++) { free(lev[ch].v); free(levhp[ch].v); }

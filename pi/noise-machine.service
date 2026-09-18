@@ -26,6 +26,14 @@ Type=notify
 NotifyAccess=main
 WatchdogSec=10s
 
+# The generator retries snd_pcm_open() once a second forever, and only sends
+# READY=1 after its first successful write. With the default 90 s
+# TimeoutStartSec, a device that is slow to appear would get the process killed
+# mid-retry and restarted, accomplishing nothing but a 90-second thrash cycle.
+# The retry loop IS the dependency mechanism here, so let it own the waiting.
+# The running state is still covered by WatchdogSec above.
+TimeoutStartSec=infinity
+
 ExecStart=/usr/local/bin/noise --config /etc/noise-machine.conf
 
 # Restart=always, not on-failure. on-failure does not fire on exit code 0 or on
@@ -64,15 +72,31 @@ ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictNamespaces=yes
 RestrictRealtime=no
-MemoryDenyWriteExecute=yes
 RestrictAddressFamilies=AF_UNIX
-DeviceAllow=char-alsa rw
 
-# Deliberately not set: SystemCallFilter. @system-service does not clearly
-# cover mlockall and sched_setscheduler across kernel versions, and a filter
-# that silently blocks those would degrade the realtime guarantees this unit
-# exists to provide. Add it only after confirming the service still starts and
-# still logs "scheduler SCHED_FIFO" on this kernel.
+# THREE DIRECTIVES DELIBERATELY LEFT OFF, all defence-in-depth, all of which can
+# silently stop audio and none of which could be tested before deployment.
+# Enable them one at a time AFTER the service is confirmed working, checking
+# `systemctl status noise-machine` and `journalctl -u noise-machine` each time.
+#
+#   DeviceAllow=char-alsa rw
+#     Looks additive; is not. systemd.resource-control(5) says DevicePolicy=auto
+#     (the default) "allows access to all devices if no explicit DeviceAllow= is
+#     present" -- so adding one entry flips the effective policy to `closed`.
+#     That should still be sufficient (closed permits /dev/null, /dev/zero,
+#     /dev/full, /dev/random and /dev/urandom, and char-alsa covers /dev/snd/*),
+#     but if anything else is needed the device simply fails to open.
+#
+#   MemoryDenyWriteExecute=yes
+#     libasound dlopen()s plugin modules. Ordinary dlopen does not need W+X and
+#     this is widely used with hardened services, but a failure here surfaces as
+#     snd_pcm_open failing forever in the retry loop, which is a confusing way
+#     to find out.
+#
+#   SystemCallFilter=@system-service
+#     Does not clearly cover mlockall and sched_setscheduler across kernel
+#     versions. A filter that silently blocks those would quietly remove the
+#     realtime guarantees this unit exists to provide.
 
 [Install]
 WantedBy=multi-user.target
