@@ -1,27 +1,78 @@
 [Unit]
-Description=Brown noise playback
-After=sound.target
-StartLimitIntervalSec=60
-StartLimitBurst=5
+Description=Brown noise generator
+Wants=sound.target noise-mixer.service
+After=sound.target noise-mixer.service
+
+# sound.target is listed in BOTH Wants= and After=: an After= alone is inert,
+# because ordering only applies when the other unit is actually in the boot
+# transaction. Even so, neither target guarantees the device node exists, so the
+# generator retries snd_pcm_open() once a second forever rather than relying on
+# ordering. That retry loop -- not a dependency, and certainly not the old
+# `ExecStartPre=/bin/sleep 2` -- is what makes the cold-boot race safe.
+
+# No start rate limit. StartLimitBurst=5 with RestartSec=5 is what bricked the
+# previous build: any persistent fault burned all five attempts in ~28 s and
+# systemd then parked the unit in `failed` forever, with no timer or socket to
+# ever retry it. An appliance must never reach a state a human has to clear.
+StartLimitIntervalSec=0
 
 [Service]
-Type=simple
-User=root
-ExecStartPre=/bin/sh -c 'amixer -c 0 set PCM mute 2>/dev/null || true'
-ExecStartPre=/bin/sleep 2
-ExecStart=/usr/bin/mpv \
-    --no-video \
-    --loop-file=inf \
-    --audio-device=alsa/hw:0,0 \
-    --cache=yes \
-    --demuxer-max-bytes=100MiB \
-    --demuxer-readahead-secs=300 \
-    --really-quiet \
-    /opt/noise-machine/brown-noise.wav
-ExecStartPost=/bin/sleep 1
-ExecStartPost=/bin/sh -c 'amixer -c 0 set PCM unmute 2>/dev/null || true'
-Restart=on-failure
-RestartSec=5
+# Type=notify, not simple. Type=simple reports the unit active at fork(),
+# before the process has even parsed its options, so a wedged player kept the
+# unit green while the speaker was silent. The generator now sends READY=1
+# only after its first successful write to the sound device, and WATCHDOG=1
+# every period after that, so a hang is detected and restarted.
+Type=notify
+NotifyAccess=main
+WatchdogSec=10s
+
+ExecStart=/usr/local/bin/noise --config /etc/noise-machine.conf
+
+# Restart=always, not on-failure. on-failure does not fire on exit code 0 or on
+# SIGTERM/SIGINT/SIGHUP/SIGPIPE, and several realistic paths end the process
+# cleanly -- after which the unit shows `inactive (dead)` rather than `failed`,
+# so even `systemctl status` looks benign while the room is silent.
+Restart=always
+RestartSec=1
+
+User=noise
+Group=noise
+SupplementaryGroups=audio
+
+# The generator needs a few hundred microseconds per period but must never miss
+# one. It spends its life blocked in snd_pcm_writei, so SCHED_FIFO cannot spin a
+# core. Priority 20 sits below the kernel's own realtime threads.
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=20
+LimitRTPRIO=20
+LimitMEMLOCK=infinity
+IOSchedulingClass=realtime
+IOSchedulingPriority=2
+
+# Do not let the OOM killer pick this process. There is nothing else on the box
+# worth keeping alive, and with zram swap a reclaim stall is the likelier risk.
+OOMScoreAdjust=-900
+
+# It needs the sound device, its config file, and nothing else.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=no
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX
+DeviceAllow=char-alsa rw
+
+# Deliberately not set: SystemCallFilter. @system-service does not clearly
+# cover mlockall and sched_setscheduler across kernel versions, and a filter
+# that silently blocks those would degrade the realtime guarantees this unit
+# exists to provide. Add it only after confirming the service still starts and
+# still logs "scheduler SCHED_FIFO" on this kernel.
 
 [Install]
 WantedBy=multi-user.target

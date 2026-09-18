@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(soxi:*)",
+      "Bash(bash:*)",
+      "Bash(ssh:*)",
+      "Bash(scp:*)"
+    ]
+  },
+  "sandbox": {
+    "excludedCommands": ["ssh", "scp"]
+  }
+}
